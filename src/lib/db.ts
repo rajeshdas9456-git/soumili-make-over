@@ -3,52 +3,85 @@ import path from 'path';
 import { initialSettings, initialServices, initialPackages, initialCategories, initialGallery, initialTestimonials } from './initialData';
 import { WebsiteSettings, ServiceItem, PricingPackage, GalleryCategory, GalleryImage, Testimonial, BookingEnquiry } from '@/types/database';
 
-const DATA_DIR = path.join(process.cwd(), 'data');
+// Global memory cache for serverless environments (Vercel)
+const memoryCache: Record<string, any> = {
+  settings: initialSettings,
+  services: initialServices,
+  packages: initialPackages,
+  categories: initialCategories,
+  gallery: initialGallery,
+  testimonials: initialTestimonials,
+  enquiries: [] as BookingEnquiry[]
+};
 
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+// Safe fallback for serverless read/write
+function isServerless() {
+  return process.env.VERCEL === '1' || process.env.NODE_ENV === 'production';
+}
+
+function getDataDir() {
+  try {
+    if (isServerless()) {
+      return path.join('/tmp', 'data');
+    }
+    return path.join(process.cwd(), 'data');
+  } catch {
+    return '/tmp';
+  }
 }
 
 function getFilePath(filename: string) {
-  return path.join(DATA_DIR, `${filename}.json`);
+  return path.join(getDataDir(), `${filename}.json`);
 }
 
-function readJSON<T>(filename: string, defaultData: T): T {
-  const file = getFilePath(filename);
+function readData<T>(filename: string, defaultData: T): T {
+  // Always check memory first
+  if (memoryCache[filename] !== undefined) {
+    return memoryCache[filename] as T;
+  }
+
   try {
+    const file = getFilePath(filename);
     if (fs.existsSync(file)) {
       const content = fs.readFileSync(file, 'utf-8');
-      return JSON.parse(content) as T;
+      const parsed = JSON.parse(content) as T;
+      memoryCache[filename] = parsed;
+      return parsed;
     }
   } catch (error) {
-    console.error(`Error reading ${filename}.json:`, error);
+    // Ignore file read errors in serverless
   }
-  // If not exist, write default
-  writeJSON(filename, defaultData);
+
+  memoryCache[filename] = defaultData;
   return defaultData;
 }
 
-function writeJSON<T>(filename: string, data: T): void {
-  const file = getFilePath(filename);
+function writeData<T>(filename: string, data: T): void {
+  memoryCache[filename] = data;
   try {
+    const dir = getDataDir();
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    const file = getFilePath(filename);
     fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf-8');
   } catch (error) {
-    console.error(`Error writing ${filename}.json:`, error);
+    // Serverless fallback continues using memoryCache
   }
 }
 
 export const db = {
   // Settings
-  getSettings: (): WebsiteSettings => readJSON<WebsiteSettings>('settings', initialSettings),
+  getSettings: (): WebsiteSettings => readData<WebsiteSettings>('settings', initialSettings),
   updateSettings: (data: Partial<WebsiteSettings>): WebsiteSettings => {
     const current = db.getSettings();
     const updated = { ...current, ...data, updated_at: new Date().toISOString() };
-    writeJSON('settings', updated);
+    writeData('settings', updated);
     return updated;
   },
 
   // Services
-  getServices: (): ServiceItem[] => readJSON<ServiceItem[]>('services', initialServices),
+  getServices: (): ServiceItem[] => readData<ServiceItem[]>('services', initialServices),
   getServiceBySlug: (slug: string): ServiceItem | undefined => {
     return db.getServices().find(s => s.slug === slug);
   },
@@ -58,7 +91,7 @@ export const db = {
       const index = services.findIndex(s => s.id === service.id);
       if (index !== -1) {
         services[index] = { ...services[index], ...service } as ServiceItem;
-        writeJSON('services', services);
+        writeData('services', services);
         return services[index];
       }
     }
@@ -75,19 +108,19 @@ export const db = {
       created_at: new Date().toISOString()
     };
     services.push(newService);
-    writeJSON('services', services);
+    writeData('services', services);
     return newService;
   },
   deleteService: (id: string): boolean => {
     const services = db.getServices();
     const filtered = services.filter(s => s.id !== id);
-    writeJSON('services', filtered);
+    writeData('services', filtered);
     return true;
   },
 
   // Pricing Packages
   getPackages: (publishedOnly = false): PricingPackage[] => {
-    const packages = readJSON<PricingPackage[]>('packages', initialPackages);
+    const packages = readData<PricingPackage[]>('packages', initialPackages);
     if (publishedOnly) {
       return packages.filter(p => p.is_published);
     }
@@ -102,7 +135,7 @@ export const db = {
       const index = packages.findIndex(p => p.id === pkg.id);
       if (index !== -1) {
         packages[index] = { ...packages[index], ...pkg } as PricingPackage;
-        writeJSON('packages', packages);
+        writeData('packages', packages);
         return packages[index];
       }
     }
@@ -121,25 +154,25 @@ export const db = {
       created_at: new Date().toISOString()
     };
     packages.push(newPkg);
-    writeJSON('packages', packages);
+    writeData('packages', packages);
     return newPkg;
   },
   deletePackage: (id: string): boolean => {
     const packages = db.getPackages();
     const filtered = packages.filter(p => p.id !== id);
-    writeJSON('packages', filtered);
+    writeData('packages', filtered);
     return true;
   },
 
   // Gallery Categories
-  getCategories: (): GalleryCategory[] => readJSON<GalleryCategory[]>('categories', initialCategories),
+  getCategories: (): GalleryCategory[] => readData<GalleryCategory[]>('categories', initialCategories),
   saveCategory: (category: Partial<GalleryCategory> & { name: string }): GalleryCategory => {
     const categories = db.getCategories();
     if (category.id) {
       const idx = categories.findIndex(c => c.id === category.id);
       if (idx !== -1) {
         categories[idx] = { ...categories[idx], ...category } as GalleryCategory;
-        writeJSON('categories', categories);
+        writeData('categories', categories);
         return categories[idx];
       }
     }
@@ -151,18 +184,18 @@ export const db = {
       created_at: new Date().toISOString()
     };
     categories.push(newCat);
-    writeJSON('categories', categories);
+    writeData('categories', categories);
     return newCat;
   },
   deleteCategory: (id: string): boolean => {
     const categories = db.getCategories();
-    writeJSON('categories', categories.filter(c => c.id !== id));
+    writeData('categories', categories.filter(c => c.id !== id));
     return true;
   },
 
   // Gallery Images
   getGallery: (publishedOnly = false): GalleryImage[] => {
-    const gallery = readJSON<GalleryImage[]>('gallery', initialGallery);
+    const gallery = readData<GalleryImage[]>('gallery', initialGallery);
     const categories = db.getCategories();
     const mapped = gallery.map(item => ({
       ...item,
@@ -174,12 +207,12 @@ export const db = {
     return mapped;
   },
   saveGalleryImage: (img: Partial<GalleryImage> & { title: string; image_url: string }): GalleryImage => {
-    const gallery = readJSON<GalleryImage[]>('gallery', initialGallery);
+    const gallery = readData<GalleryImage[]>('gallery', initialGallery);
     if (img.id) {
       const idx = gallery.findIndex(g => g.id === img.id);
       if (idx !== -1) {
         gallery[idx] = { ...gallery[idx], ...img } as GalleryImage;
-        writeJSON('gallery', gallery);
+        writeData('gallery', gallery);
         return gallery[idx];
       }
     }
@@ -194,18 +227,18 @@ export const db = {
       created_at: new Date().toISOString()
     };
     gallery.push(newImg);
-    writeJSON('gallery', gallery);
+    writeData('gallery', gallery);
     return newImg;
   },
   deleteGalleryImage: (id: string): boolean => {
-    const gallery = readJSON<GalleryImage[]>('gallery', initialGallery);
-    writeJSON('gallery', gallery.filter(g => g.id !== id));
+    const gallery = readData<GalleryImage[]>('gallery', initialGallery);
+    writeData('gallery', gallery.filter(g => g.id !== id));
     return true;
   },
 
   // Testimonials
   getTestimonials: (publishedOnly = false): Testimonial[] => {
-    const testimonials = readJSON<Testimonial[]>('testimonials', initialTestimonials);
+    const testimonials = readData<Testimonial[]>('testimonials', initialTestimonials);
     if (publishedOnly) {
       return testimonials.filter(t => t.is_published);
     }
@@ -217,7 +250,7 @@ export const db = {
       const idx = testimonials.findIndex(t => t.id === test.id);
       if (idx !== -1) {
         testimonials[idx] = { ...testimonials[idx], ...test } as Testimonial;
-        writeJSON('testimonials', testimonials);
+        writeData('testimonials', testimonials);
         return testimonials[idx];
       }
     }
@@ -235,17 +268,17 @@ export const db = {
       created_at: new Date().toISOString()
     };
     testimonials.push(newTest);
-    writeJSON('testimonials', testimonials);
+    writeData('testimonials', testimonials);
     return newTest;
   },
   deleteTestimonial: (id: string): boolean => {
     const testimonials = db.getTestimonials();
-    writeJSON('testimonials', testimonials.filter(t => t.id !== id));
+    writeData('testimonials', testimonials.filter(t => t.id !== id));
     return true;
   },
 
   // Booking Enquiries
-  getEnquiries: (): BookingEnquiry[] => readJSON<BookingEnquiry[]>('enquiries', []),
+  getEnquiries: (): BookingEnquiry[] => readData<BookingEnquiry[]>('enquiries', []),
   saveEnquiry: (enquiry: Omit<BookingEnquiry, 'id' | 'status' | 'created_at'>): BookingEnquiry => {
     const enquiries = db.getEnquiries();
     const newEnquiry: BookingEnquiry = {
@@ -255,7 +288,7 @@ export const db = {
       created_at: new Date().toISOString()
     };
     enquiries.unshift(newEnquiry);
-    writeJSON('enquiries', enquiries);
+    writeData('enquiries', enquiries);
     return newEnquiry;
   },
   updateEnquiryStatus: (id: string, status: BookingEnquiry['status']): boolean => {
@@ -263,7 +296,7 @@ export const db = {
     const idx = enquiries.findIndex(e => e.id === id);
     if (idx !== -1) {
       enquiries[idx].status = status;
-      writeJSON('enquiries', enquiries);
+      writeData('enquiries', enquiries);
       return true;
     }
     return false;
