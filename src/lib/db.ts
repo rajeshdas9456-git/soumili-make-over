@@ -3,26 +3,27 @@ import path from 'path';
 import { initialSettings, initialServices, initialPackages, initialCategories, initialGallery, initialTestimonials } from './initialData';
 import { WebsiteSettings, ServiceItem, PricingPackage, GalleryCategory, GalleryImage, Testimonial, BookingEnquiry } from '@/types/database';
 
-// Global memory cache for serverless environments (Vercel)
-const memoryCache: Record<string, any> = {
-  settings: initialSettings,
-  services: initialServices,
-  packages: initialPackages,
-  categories: initialCategories,
-  gallery: initialGallery,
-  testimonials: initialTestimonials,
-  enquiries: [] as BookingEnquiry[]
-};
-
-// Safe fallback for serverless read/write
-function isServerless() {
-  return process.env.VERCEL === '1' || process.env.NODE_ENV === 'production';
+// Global shared state across serverless invocations within the process
+declare global {
+  var __soumili_db: {
+    settings?: WebsiteSettings;
+    services?: ServiceItem[];
+    packages?: PricingPackage[];
+    categories?: GalleryCategory[];
+    gallery?: GalleryImage[];
+    testimonials?: Testimonial[];
+    enquiries?: BookingEnquiry[];
+  } | undefined;
 }
 
-function getDataDir() {
+if (!global.__soumili_db) {
+  global.__soumili_db = {};
+}
+
+function getStorageDir(): string {
   try {
-    if (isServerless()) {
-      return path.join('/tmp', 'data');
+    if (process.env.VERCEL === '1' || process.env.NODE_ENV === 'production') {
+      return path.join('/tmp', 'soumili_data');
     }
     return path.join(process.cwd(), 'data');
   } catch {
@@ -30,49 +31,53 @@ function getDataDir() {
   }
 }
 
-function getFilePath(filename: string) {
-  return path.join(getDataDir(), `${filename}.json`);
-}
-
-function readData<T>(filename: string, defaultData: T): T {
-  // Always check memory first
-  if (memoryCache[filename] !== undefined) {
-    return memoryCache[filename] as T;
+function readData<T>(key: keyof NonNullable<typeof global.__soumili_db>, defaultData: T): T {
+  // 1. Check in-memory global state first
+  if (global.__soumili_db && global.__soumili_db[key] !== undefined) {
+    return global.__soumili_db[key] as T;
   }
 
+  // 2. Try disk storage
   try {
-    const file = getFilePath(filename);
-    if (fs.existsSync(file)) {
-      const content = fs.readFileSync(file, 'utf-8');
+    const dir = getStorageDir();
+    const filePath = path.join(dir, `${String(key)}.json`);
+    if (fs.existsSync(filePath)) {
+      const content = fs.readFileSync(filePath, 'utf-8');
       const parsed = JSON.parse(content) as T;
-      memoryCache[filename] = parsed;
+      if (global.__soumili_db) global.__soumili_db[key] = parsed as any;
       return parsed;
     }
-  } catch (error) {
-    // Ignore file read errors in serverless
+  } catch (err) {
+    // Disk read fallback
   }
 
-  memoryCache[filename] = defaultData;
+  // 3. Fallback to default
+  if (global.__soumili_db) global.__soumili_db[key] = defaultData as any;
   return defaultData;
 }
 
-function writeData<T>(filename: string, data: T): void {
-  memoryCache[filename] = data;
+function writeData<T>(key: keyof NonNullable<typeof global.__soumili_db>, data: T): void {
+  // Update memory
+  if (global.__soumili_db) {
+    global.__soumili_db[key] = data as any;
+  }
+
+  // Save to disk
   try {
-    const dir = getDataDir();
+    const dir = getStorageDir();
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
-    const file = getFilePath(filename);
-    fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf-8');
-  } catch (error) {
-    // Serverless fallback continues using memoryCache
+    const filePath = path.join(dir, `${String(key)}.json`);
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
+  } catch (err) {
+    // Silent fail in isolated serverless
   }
 }
 
 export const db = {
   // Settings
-  getSettings: (): WebsiteSettings => readData<WebsiteSettings>('settings', initialSettings),
+  getSettings: (): WebsiteSettings => readData('settings', initialSettings),
   updateSettings: (data: Partial<WebsiteSettings>): WebsiteSettings => {
     const current = db.getSettings();
     const updated = { ...current, ...data, updated_at: new Date().toISOString() };
@@ -81,12 +86,12 @@ export const db = {
   },
 
   // Services
-  getServices: (): ServiceItem[] => readData<ServiceItem[]>('services', initialServices),
+  getServices: (): ServiceItem[] => readData('services', initialServices),
   getServiceBySlug: (slug: string): ServiceItem | undefined => {
     return db.getServices().find(s => s.slug === slug);
   },
   saveService: (service: Partial<ServiceItem> & { title: string }): ServiceItem => {
-    const services = db.getServices();
+    const services = [...db.getServices()];
     if (service.id) {
       const index = services.findIndex(s => s.id === service.id);
       if (index !== -1) {
@@ -112,15 +117,14 @@ export const db = {
     return newService;
   },
   deleteService: (id: string): boolean => {
-    const services = db.getServices();
-    const filtered = services.filter(s => s.id !== id);
-    writeData('services', filtered);
+    const services = db.getServices().filter(s => s.id !== id);
+    writeData('services', services);
     return true;
   },
 
   // Pricing Packages
   getPackages: (publishedOnly = false): PricingPackage[] => {
-    const packages = readData<PricingPackage[]>('packages', initialPackages);
+    const packages = readData('packages', initialPackages);
     if (publishedOnly) {
       return packages.filter(p => p.is_published);
     }
@@ -130,7 +134,7 @@ export const db = {
     return db.getPackages().find(p => p.id === id);
   },
   savePackage: (pkg: Partial<PricingPackage> & { name: string; price: number }): PricingPackage => {
-    const packages = db.getPackages();
+    const packages = [...db.getPackages()];
     if (pkg.id) {
       const index = packages.findIndex(p => p.id === pkg.id);
       if (index !== -1) {
@@ -158,16 +162,15 @@ export const db = {
     return newPkg;
   },
   deletePackage: (id: string): boolean => {
-    const packages = db.getPackages();
-    const filtered = packages.filter(p => p.id !== id);
-    writeData('packages', filtered);
+    const packages = db.getPackages().filter(p => p.id !== id);
+    writeData('packages', packages);
     return true;
   },
 
   // Gallery Categories
-  getCategories: (): GalleryCategory[] => readData<GalleryCategory[]>('categories', initialCategories),
+  getCategories: (): GalleryCategory[] => readData('categories', initialCategories),
   saveCategory: (category: Partial<GalleryCategory> & { name: string }): GalleryCategory => {
-    const categories = db.getCategories();
+    const categories = [...db.getCategories()];
     if (category.id) {
       const idx = categories.findIndex(c => c.id === category.id);
       if (idx !== -1) {
@@ -188,14 +191,14 @@ export const db = {
     return newCat;
   },
   deleteCategory: (id: string): boolean => {
-    const categories = db.getCategories();
-    writeData('categories', categories.filter(c => c.id !== id));
+    const categories = db.getCategories().filter(c => c.id !== id);
+    writeData('categories', categories);
     return true;
   },
 
   // Gallery Images
   getGallery: (publishedOnly = false): GalleryImage[] => {
-    const gallery = readData<GalleryImage[]>('gallery', initialGallery);
+    const gallery = readData('gallery', initialGallery);
     const categories = db.getCategories();
     const mapped = gallery.map(item => ({
       ...item,
@@ -207,7 +210,7 @@ export const db = {
     return mapped;
   },
   saveGalleryImage: (img: Partial<GalleryImage> & { title: string; image_url: string }): GalleryImage => {
-    const gallery = readData<GalleryImage[]>('gallery', initialGallery);
+    const gallery = [...readData('gallery', initialGallery)];
     if (img.id) {
       const idx = gallery.findIndex(g => g.id === img.id);
       if (idx !== -1) {
@@ -231,21 +234,21 @@ export const db = {
     return newImg;
   },
   deleteGalleryImage: (id: string): boolean => {
-    const gallery = readData<GalleryImage[]>('gallery', initialGallery);
-    writeData('gallery', gallery.filter(g => g.id !== id));
+    const gallery = readData<GalleryImage[]>('gallery', initialGallery).filter(g => g.id !== id);
+    writeData('gallery', gallery);
     return true;
   },
 
   // Testimonials
   getTestimonials: (publishedOnly = false): Testimonial[] => {
-    const testimonials = readData<Testimonial[]>('testimonials', initialTestimonials);
+    const testimonials = readData('testimonials', initialTestimonials);
     if (publishedOnly) {
       return testimonials.filter(t => t.is_published);
     }
     return testimonials;
   },
   saveTestimonial: (test: Partial<Testimonial> & { client_name: string; quote: string }): Testimonial => {
-    const testimonials = db.getTestimonials();
+    const testimonials = [...db.getTestimonials()];
     if (test.id) {
       const idx = testimonials.findIndex(t => t.id === test.id);
       if (idx !== -1) {
@@ -272,15 +275,15 @@ export const db = {
     return newTest;
   },
   deleteTestimonial: (id: string): boolean => {
-    const testimonials = db.getTestimonials();
-    writeData('testimonials', testimonials.filter(t => t.id !== id));
+    const testimonials = db.getTestimonials().filter(t => t.id !== id);
+    writeData('testimonials', testimonials);
     return true;
   },
 
   // Booking Enquiries
-  getEnquiries: (): BookingEnquiry[] => readData<BookingEnquiry[]>('enquiries', []),
+  getEnquiries: (): BookingEnquiry[] => readData('enquiries', []),
   saveEnquiry: (enquiry: Omit<BookingEnquiry, 'id' | 'status' | 'created_at'>): BookingEnquiry => {
-    const enquiries = db.getEnquiries();
+    const enquiries = [...db.getEnquiries()];
     const newEnquiry: BookingEnquiry = {
       ...enquiry,
       id: `enq-${Date.now()}`,
@@ -292,7 +295,7 @@ export const db = {
     return newEnquiry;
   },
   updateEnquiryStatus: (id: string, status: BookingEnquiry['status']): boolean => {
-    const enquiries = db.getEnquiries();
+    const enquiries = [...db.getEnquiries()];
     const idx = enquiries.findIndex(e => e.id === id);
     if (idx !== -1) {
       enquiries[idx].status = status;
